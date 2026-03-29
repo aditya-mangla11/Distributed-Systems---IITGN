@@ -2,8 +2,8 @@
 Raft-replicated AFS gRPC server
 
 Starts a single gRPC server that exposes two services on one port:
-  1. AFSFileSystem  — the existing client-facing file-system API (fs.proto)
-  2. RaftService    — inter-node Raft consensus RPCs              (raft.proto)
+  1. AFSFileSystem  - the existing client-facing file-system API (fs.proto)
+  2. RaftService    - inter-node Raft consensus RPCs              (raft.proto)
 
 Usage:
     python raft_server.py --node_id 0 --config nodes_config.json
@@ -33,7 +33,7 @@ logging.basicConfig(
 logger = logging.getLogger("raft_server")
 
 
-# AFS servicer — wraps RaftNode for client-facing operations
+# AFS servicer - wraps RaftNode for client-facing operations
 class RaftAFSServicer(fs_pb2_grpc.AFSFileSystemServicer):
     """
     Replaces the single-node AFSServicer from server.py.
@@ -96,7 +96,7 @@ class RaftAFSServicer(fs_pb2_grpc.AFSFileSystemServicer):
             logger.info("[SM] Snapshot installed")
             return {"success": True}
 
-        # noop — nothing to apply
+        # noop - nothing to apply
         return {"success": True}
 
     # Helpers
@@ -209,12 +209,12 @@ class RaftAFSServicer(fs_pb2_grpc.AFSFileSystemServicer):
         filename = file_info["filename"]
 
         if file_info["mode"] != "w":
-            # Read-only close — no replication needed
+            # Read-only close - no replication needed
             resp = fs_pb2.CloseResponse(success=True, new_version=0)
             self._cache_resp(request.client_id, request.seq_num, resp)
             return resp
 
-        # Write path — must go through Raft
+        # Write path - must go through Raft
         if not self.raft.is_leader():
             return fs_pb2.CloseResponse(
                 success=False,
@@ -239,7 +239,7 @@ class RaftAFSServicer(fs_pb2_grpc.AFSFileSystemServicer):
                 success=False, error_message=str(e))
 
 
-# Raft gRPC servicer — handles inter-node RPCs
+# Raft gRPC servicer - handles inter-node RPCs
 class RaftGRPCServicer(raft_pb2_grpc.RaftServiceServicer):
 
     def __init__(self, raft: RaftNode, node_configs: list):
@@ -295,7 +295,7 @@ class RaftGRPCServicer(raft_pb2_grpc.RaftServiceServicer):
         if lid is None:
             return raft_pb2.GetLeaderReply(has_leader=False)
         if addr is None and lid == self.raft.node_id:
-            # This node is the leader — find own address from config
+            # This node is the leader - find own address from config
             for nc in self.node_configs:
                 if nc["id"] == lid:
                     addr = f"{nc['host']}:{nc['port']}"

@@ -29,9 +29,9 @@ start_node 2
 
 echo ""
 echo "Cluster started!  Node PIDs saved to .cluster_pids"
-echo "  Node 0 → localhost:50051   (logs/node0.log)"
-echo "  Node 1 → localhost:50052   (logs/node1.log)"
-echo "  Node 2 → localhost:50053   (logs/node2.log)"
+echo "  Node 0 -> localhost:50051   (logs/node0.log)"
+echo "  Node 1 -> localhost:50052   (logs/node1.log)"
+echo "  Node 2 -> localhost:50053   (logs/node2.log)"
 echo ""
 echo "Check the node0 log: tail -f logs/node0.log . Wait ~4 seconds for leader election, then run the client. To run client test file: python raft_client_test.py ."
 echo "To stop:  ./stop_cluster.sh"

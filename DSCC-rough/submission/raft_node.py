@@ -174,7 +174,7 @@ class RaftNode:
                 return {"term": self.current_term, "success": False,
                         "conflict_index": 0, "conflict_term": 0}
 
-            # Valid leader — reset timer and update state
+            # Valid leader - reset timer and update state
             if term > self.current_term:
                 self._become_follower(term)
             elif self.state == self.CANDIDATE:
@@ -485,7 +485,7 @@ class RaftNode:
     def _last_log_term(self) -> int:
         return self.log[-1]["term"] if self.log else 0
 
-    # Applier thread — applies committed entries to the state machine
+    # Applier thread - applies committed entries to the state machine
     def _start_applier(self):
         def applier_loop():
             while True:

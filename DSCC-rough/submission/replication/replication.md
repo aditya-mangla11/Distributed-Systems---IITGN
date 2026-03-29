@@ -21,7 +21,7 @@ The project workload has two key properties that make primary-backup the optimal
 | Input files are **static** | No concurrent write conflicts to resolve |
 | Output (`primes.txt`) is **write-once** | A single write event, no concurrent updates |
 | Workload is **read-heavy** | Backups can serve reads, reducing load on primary |
-| Whole-file caching on clients | Replication granularity is whole-file — simple to propagate |
+| Whole-file caching on clients | Replication granularity is whole-file - simple to propagate |
 
 **Raft / Paxos** solve the *arbitrary concurrent write* problem via log replication and quorum commits. Since this workload has no concurrent writes, paying that complexity cost is unnecessary.
 
@@ -43,32 +43,23 @@ Primary-backup has known failure modes that the implementation must address:
 
 ## 3. System Architecture
 
-```
-┌──────────────────────────────────────────────────────────────────────┐
-│                           Clients                                    │
-│  ReplicatedAFSClientStub  ──────────────────────────────────────     │
-│  • Discovers primary via GetClusterInfo                              │
-│  • Routes all writes to primary                                      │
-│  • On FAILED_PRECONDITION("NOT_PRIMARY:<addr>") -> redirects         │
-│  • On UNAVAILABLE -> rediscovers primary, retries with backoff        │
-└──────────────┬───────────────────────────────────────┬──────────────┘
-               │  AFSFileSystem gRPC (port 50050)       │
-               ▼                                        ▼
-┌─────────────────────────┐              ┌─────────────────────────┐
-│  Server 0  (PRIMARY)    │◄────────────►│  Server 1  (BACKUP)     │
-│  localhost:50050        │  heartbeat   │  localhost:50051        │
-│  data_dir: ./data_50050 │  + replica   │  data_dir: ./data_50051 │
-└──────────┬──────────────┘  RPCs        └──────────┬──────────────┘
-           │                                        │
-           │   ReplicationService gRPC              │
-           │   (same port as AFSFileSystem)         │
-           └──────────────────┬─────────────────────┘
-                              │
-              ┌───────────────▼───────────────┐
-              │  Server 2  (BACKUP)           │
-              │  localhost:50052              │
-              │  data_dir: ./data_50052       │
-              └───────────────────────────────┘
+```mermaid
+graph TB
+    subgraph Clients
+        C["ReplicatedAFSClientStub<br/>• Discovers primary via GetClusterInfo<br/>• Routes all writes to primary<br/>• On FAILED_PRECONDITION → redirects<br/>• On UNAVAILABLE → rediscovers primary, retries with backoff"]
+    end
+
+    subgraph Cluster
+        S0["Server 0 (PRIMARY)<br/>localhost:50050<br/>data_dir: ./data_50050"]
+        S1["Server 1 (BACKUP)<br/>localhost:50051<br/>data_dir: ./data_50051"]
+        S2["Server 2 (BACKUP)<br/>localhost:50052<br/>data_dir: ./data_50052"]
+    end
+
+    C -->|"AFSFileSystem gRPC"| S0
+    C -->|"AFSFileSystem gRPC"| S1
+    S0 <-->|"heartbeat + replica RPCs<br/>(ReplicationService gRPC)"| S1
+    S0 <-->|"heartbeat + replica RPCs<br/>(ReplicationService gRPC)"| S2
+    S1 <-->|"heartbeat + replica RPCs<br/>(ReplicationService gRPC)"| S2
 ```
 
 **Key architectural decisions:**
@@ -186,26 +177,25 @@ class ReplicatedAFSServer(
 
 On startup, a server **always queries its peers first** before assuming any role. This prevents the most common split-brain scenario: a server that was previously primary restarting and reclaiming that role even though another server was elected primary during its absence.
 
-```
-_determine_startup_role()
-│
-├── _query_peers_for_primary()   <- live RPCs to all known peers
-│   │
-│   ├── peers respond with a primary address
-│   │   ├── claimed == my_addr  ->  "Peers confirm us as PRIMARY"
-│   │   │   load local files, ready = True
-│   │   └── claimed != my_addr  ->  "Existing primary found (X). Starting as BACKUP."
-│   │       _sync_or_elect(claimed_primary)
-│   │
-│   └── no peers respond (fresh cluster or all peers down)
-│       ├── my_addr == lowest address  ->  become PRIMARY
-│       │   load local files, ready = True
-│       └── my_addr != lowest address  ->  attempt sync from preferred primary
-│           _sync_or_elect(preferred_primary)
-│
-└── _sync_or_elect(target)
-    ├── _try_sync_from(target, 15s)  -> success: role = backup, ready = True
-    └── failure after 15s  ->  _elect_new_primary()  (live election)
+```mermaid
+flowchart TD
+    A["_determine_startup_role()"] --> B["_query_peers_for_primary()<br/>live RPCs to all known peers"]
+    B --> C{"Peers respond with<br/>a primary address?"}
+    C -->|Yes| D{"claimed == my_addr?"}
+    C -->|"No peers respond<br/>(fresh cluster or all down)"| G{"my_addr ==<br/>lowest address?"}
+
+    D -->|Yes| E["Peers confirm us as PRIMARY<br/>Load local files, ready = True"]
+    D -->|No| F["Existing primary found.<br/>Starting as BACKUP.<br/>_sync_or_elect(claimed_primary)"]
+
+    G -->|Yes| H["Become PRIMARY<br/>Load local files, ready = True"]
+    G -->|No| I["Attempt sync from preferred primary<br/>_sync_or_elect(preferred_primary)"]
+
+    F --> J["_sync_or_elect(target)"]
+    I --> J
+
+    J --> K["_try_sync_from(target, 15s)"]
+    K -->|Success| L["role = backup, ready = True"]
+    K -->|"Failure after 15s"| M["_elect_new_primary()<br/>(live election)"]
 ```
 
 **Why this matters for recovery:** When Server 0 (original primary) crashes, Server 1 is elected. When Server 0 restarts, it asks peers who the primary is. Peers respond "primary = Server 1". Server 0 syncs from Server 1 and rejoins as a backup. No split-brain.
@@ -227,17 +217,27 @@ Two daemon threads run for the lifetime of the server:
 - Condition: `last_heartbeat[primary] > 0` **AND** `now - last_heartbeat[primary] > HEARTBEAT_TIMEOUT`.
   - The `> 0` guard is critical: it prevents a newly-started server from declaring an election before it has ever received a heartbeat from the primary.
 
-```
 Timeline example – primary fails at t=10:
 
-t=0   Server 1 starts, last_heartbeat[Server 0] = 0.0
-t=2   First heartbeat from Server 0 received -> last_heartbeat[Server 0] = 2.0
-t=4   Heartbeat -> 4.0
-t=6   Heartbeat -> 6.0
-t=8   Heartbeat -> 8.0
-t=10  Server 0 CRASHES
-t=12  No heartbeat received, last = 8.0, now - last = 4s < 6s -> no action
-t=14  now - last = 6s -> threshold reached -> _elect_new_primary() triggered
+```mermaid
+sequenceDiagram
+    participant S1 as Server 1 (Backup)
+    participant S0 as Server 0 (Primary)
+
+    Note over S1: t=0: Starts, last_heartbeat[S0] = 0.0
+    S0->>S1: t=2: Heartbeat
+    Note over S1: last_heartbeat[S0] = 2.0
+    S0->>S1: t=4: Heartbeat
+    Note over S1: last_heartbeat[S0] = 4.0
+    S0->>S1: t=6: Heartbeat
+    Note over S1: last_heartbeat[S0] = 6.0
+    S0->>S1: t=8: Heartbeat
+    Note over S1: last_heartbeat[S0] = 8.0
+    Note over S0: t=10: CRASHES
+    S0--xS1: t=12: No heartbeat
+    Note over S1: now - last = 4s < 6s → no action
+    S0--xS1: t=14: No heartbeat
+    Note over S1: now - last = 6s ≥ threshold → _elect_new_primary()
 ```
 
 ---
@@ -275,15 +275,21 @@ At the moment an election is triggered, the `last_heartbeat` timestamps may be s
 
 Every mutating operation on the primary is replicated to all backups **synchronously before the client is ACKed**. This guarantees that if the primary ACKs a write and then immediately crashes, at least one backup has the data.
 
-```
-Client                   Primary                  Backup 1   Backup 2
-  │                         │                        │           │
-  │──── Close(write) ──────►│                        │           │
-  │                         │─── ReplicateWrite ────►│           │
-  │                         │─── ReplicateWrite ─────────────────►│
-  │                         │◄── success ────────────│           │
-  │                         │◄── success ────────────────────────│
-  │◄─── ACK ────────────────│                        │           │
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant P as Primary
+    participant B1 as Backup 1
+    participant B2 as Backup 2
+
+    C->>P: Close(write)
+    par Replicate to backups
+        P->>B1: ReplicateWrite
+        P->>B2: ReplicateWrite
+    end
+    B1-->>P: success
+    B2-->>P: success
+    P-->>C: ACK
 ```
 
 Replication failures to individual backups are logged but do not block the primary from ACKing the client. This means:
@@ -324,8 +330,8 @@ The server serves the same `AFSFileSystem` gRPC service as the single-server imp
 
 | RPC | Restriction | Behaviour on backup |
 |---|---|---|
-| `TestVersionNumber` | Any replica | Served locally — no redirect |
-| `Open` (read mode) | Any replica | Served locally — no redirect |
+| `TestVersionNumber` | Any replica | Served locally - no redirect |
+| `Open` (read mode) | Any replica | Served locally - no redirect |
 | `Open` (write mode) | Primary only | Returns `FAILED_PRECONDITION("NOT_PRIMARY:<addr>")` |
 | `Create` | Primary only | Returns `FAILED_PRECONDITION("NOT_PRIMARY:<addr>")` |
 | `Close` (write) | Primary only | Returns `FAILED_PRECONDITION("NOT_PRIMARY:<addr>")` |
@@ -360,16 +366,15 @@ On construction:
 
 Every RPC goes through a central retry loop:
 
-```
-attempt:
-  call RPC on current primary
-  ├── success -> return response
-  ├── FAILED_PRECONDITION("NOT_PRIMARY:<addr>")
-  │   -> update primary_addr to <addr>, retry immediately
-  ├── UNAVAILABLE / DEADLINE_EXCEEDED / RESOURCE_EXHAUSTED
-  │   -> rediscover primary via _discover_primary()
-  │   -> sleep(2^attempt seconds), retry
-  └── other gRPC error -> raise
+```mermaid
+flowchart TD
+    A["attempt:<br/>call RPC on current primary"] --> B{Response?}
+    B -->|success| C[return response]
+    B -->|"FAILED_PRECONDITION<br/>(NOT_PRIMARY:addr)"| D["Update primary_addr to addr<br/>Retry immediately"]
+    B -->|"UNAVAILABLE /<br/>DEADLINE_EXCEEDED /<br/>RESOURCE_EXHAUSTED"| E["Rediscover primary via<br/>_discover_primary()<br/>Sleep 2^attempt seconds, retry"]
+    B -->|other gRPC error| F[raise exception]
+    D --> A
+    E --> A
 ```
 
 ### Primary Redirect (Transparent)
@@ -378,7 +383,7 @@ If a client sends a write RPC to a backup (e.g. because the primary changed afte
 
 1. Parses the new primary address from the error detail.
 2. Updates `self._primary_addr`.
-3. Retries the same RPC on the new primary — all transparent to the caller.
+3. Retries the same RPC on the new primary - all transparent to the caller.
 
 ### Caching
 
@@ -664,9 +669,9 @@ Run Groups A–C, G–I only (22 tests, no servers are killed).
 
 ```
 [PRE-FLIGHT] Checking connectivity …
-  ✓  machineA:50050  role=primary  primary=machineA:50050
-  ✓  machineB:50050  role=backup   primary=machineA:50050
-  ✓  machineC:50050  role=backup   primary=machineA:50050
+  YES  machineA:50050  role=primary  primary=machineA:50050
+  YES  machineB:50050  role=backup   primary=machineA:50050
+  YES  machineC:50050  role=backup   primary=machineA:50050
 ```
 
 If any server is unreachable, the runner aborts with an error.
