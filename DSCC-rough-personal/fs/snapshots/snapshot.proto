@@ -1,0 +1,55 @@
+syntax = "proto3";
+
+package snapshots;
+
+// --- Chandy-Lamport Snapshot Protocol ---
+// Used for communication between processes participating in a global snapshot.
+
+service SnapshotService {
+  // A process sends a MARKER to all its outgoing channels.
+  rpc SendMarker       (MarkerMessage)       returns (MarkerResponse)       {}
+
+  // After recording local state, a process sends its report to the initiator.
+  rpc ReportLocalState (LocalStateReport)    returns (ReportResponse)       {}
+
+  // The initiator notifies all participants that the snapshot is complete
+  // and stored in the DFS.
+  rpc SnapshotComplete (SnapshotCompleteMsg) returns (SnapshotCompleteAck) {}
+}
+
+// ---- MARKER (sent on every outgoing channel) ----
+
+message MarkerMessage {
+  string snapshot_id  = 1;   // Unique ID for this snapshot round
+  string sender_id    = 2;   // process_id of the sender
+}
+
+message MarkerResponse {
+  bool   success       = 1;
+  string error_message = 2;
+}
+
+// ---- Local-state report (participant → initiator) ----
+
+message LocalStateReport {
+  string snapshot_id       = 1;
+  string process_id        = 2;   // Who is reporting
+  bytes  serialized_state  = 3;   // JSON-encoded ProcessState
+  bytes  channel_states    = 4;   // JSON-encoded list of ChannelState dicts
+}
+
+message ReportResponse {
+  bool   success       = 1;
+  string error_message = 2;
+}
+
+// ---- Snapshot-complete notification (initiator → all) ----
+
+message SnapshotCompleteMsg {
+  string snapshot_id    = 1;
+  string dfs_filename   = 2;   // Where the snapshot was saved in the DFS
+}
+
+message SnapshotCompleteAck {
+  bool success = 1;
+}
