@@ -1,0 +1,53 @@
+# Task 2: Fault Tolerance for AFS (`fs_wo_grpc/`)
+
+## Approach
+
+Modify existing files directly. Fault tolerance additions marked with `# --- Task 2 ---` comments.
+
+---
+
+## Proposed Changes
+
+### [MODIFY] [server.py](file:///Users/aditya_mangla/Library/CloudStorage/OneDrive-iitgn.ac.in/Sem8/Distributed%20Systems/Distributed%20Project/DSCC-rough/fs_wo_grpc/server.py)
+
+- Add `dedup_cache: dict[client_id → (last_seq_num, cached_response)]` to `AFSLogic.__init__()`
+- Add `_check_idempotent(client_id, seq_num)` helper that returns cached response if duplicate
+- `create_file()` and `close_file()` accept optional `client_id`/`seq_num`, check dedup before executing
+
+---
+
+### [MODIFY] [server_stub.py](file:///Users/aditya_mangla/Library/CloudStorage/OneDrive-iitgn.ac.in/Sem8/Distributed%20Systems/Distributed%20Project/DSCC-rough/fs_wo_grpc/server_stub.py)
+
+- Forward `client_id`/`seq_num` from request dicts to `create_file()`/`close_file()` (just pass `**args` through — already works since dicts are passed as kwargs)
+
+---
+
+### [MODIFY] [client_stub.py](file:///Users/aditya_mangla/Library/CloudStorage/OneDrive-iitgn.ac.in/Sem8/Distributed%20Systems/Distributed%20Project/DSCC-rough/fs_wo_grpc/client_stub.py)
+
+- Generate `client_id = str(uuid4())` on init
+- Add `seq_num` counter (incremented per mutating RPC)
+- Enhance `_call_rpc()`: retry up to 3 times with exponential backoff (1s, 2s, 4s) on transport errors
+- `create()` and `close()` attach `client_id` + `seq_num` to request
+
+---
+
+### [MODIFY] [client.py](file:///Users/aditya_mangla/Library/CloudStorage/OneDrive-iitgn.ac.in/Sem8/Distributed%20Systems/Distributed%20Project/DSCC-rough/fs_wo_grpc/client.py)
+
+Add 3 new tests:
+
+| Test | Description |
+|---|---|
+| **TEST 16** | Idempotent create — replay same `(client_id, seq_num)`, verify no duplicate error |
+| **TEST 17** | Idempotent close — replay same `(client_id, seq_num)`, verify version increments once |
+| **TEST 18** | Retry on disconnect — break socket mid-flow, verify auto-reconnect + completion |
+
+---
+
+## Verification
+
+```bash
+# Terminal 1                    # Terminal 2
+cd fs_wo_grpc && python server.py    cd fs_wo_grpc && python client.py
+```
+
+All 18 tests (15 existing + 3 new) must PASS.

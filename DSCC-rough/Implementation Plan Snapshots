@@ -1,0 +1,206 @@
+# Task 5: Fault Tolerance via Global Snapshots (Chandy-Lamport)
+
+## Background & Requirements
+
+From the spec (FINAL-PROJECT.md):
+
+> The application will periodically capture a **consistent global snapshot** of its state and save it on the distributed file system. On worker failure(s), the application will recover from the latest snapshot instead of starting over.
+
+Key points:
+- Uses the **Chandy-Lamport snapshot algorithm**
+- Snapshots are stored in the **distributed file system** (the one from Tasks 1-3)
+- Single worker failure → only that worker recovers
+- Majority failure → all workers recover from the snapshot
+- No existing libraries allowed (except for primality testing)
+
+## Current Codebase State
+
+| Component | Status |
+|---|---|
+| Distributed FS (Tasks 1-3) | ✅ Fully implemented in `fs/replication/` |
+| Prime finding application (Task 4) | ⚠️ Only standalone C++ primality tests in `prime_no/`. **No distributed coordinator/worker application exists yet.** |
+
+> [!IMPORTANT]
+> Task 5 depends on Task 4 (the distributed prime-finding application). Since Task 4 is not yet integrated, we need to either:
+> 1. **Wait for Task 4** to be integrated, then add snapshotting on top, OR
+> 2. **Build Task 5 in a way that's decoupled** from the specific Task 4 implementation, so it can be plugged in later.
+>
+> I recommend option 2: design the snapshot system as a **reusable module** that any coordinator-worker application can use.
+
+---
+
+## Proposed Architecture
+
+### System Model (Coordinator-Worker)
+
+The distributed prime-finding app (Task 4) will likely use a **coordinator-worker** pattern:
+
+```
+┌─────────────┐       ┌──────────┐
+│ Coordinator │──────▶│ Worker 1 │
+│             │──────▶│ Worker 2 │
+│             │──────▶│ Worker 3 │
+└──────┬──────┘       └──────────┘
+       │
+       ▼
+  ┌──────────┐
+  │  DFS     │  (fs/replication/)
+  │  Servers │
+  └──────────┘
+```
+
+> [!TIP]
+> **Topology Independence:** The Chandy-Lamport algorithm natively supports **any network topology** (ring, mesh, peer-to-peer). 
+> 
+> By designing the `SnapshotManager` abstractly, any node in the system can initiate a snapshot. The protocol relies only on "incoming channels" and "outgoing channels" between generic peers. 
+> 
+> Even if Task 4 decides to use a purely peer-to-peer topology without a central coordinator, the `SnapshotManager` will seamlessly adapt: every node simply writes its own local state shard to the DFS, or one node aggregates them.
+
+### What Gets Snapshotted
+
+The Chandy-Lamport algorithm captures a **consistent global snapshot** without stopping computation:
+
+```mermaid
+sequenceDiagram
+    participant C as Coordinator (Initiator)
+    participant W1 as Worker 1
+    participant W2 as Worker 2
+
+    Note over C: Periodic timer fires → initiate snapshot
+    C->>C: Record own local state
+    C->>W1: MARKER message
+    C->>W2: MARKER message
+
+    Note over W1: First MARKER received
+    W1->>W1: Record own local state
+    W1->>C: MARKER (back)
+    W1->>W2: MARKER (forward)
+    Note over W1: Start recording msgs from C until MARKER from C arrives (already got it → channel empty)
+
+    Note over W2: First MARKER received
+    W2->>W2: Record own local state
+    W2->>C: MARKER (back)
+    W2->>W1: MARKER (forward)
+
+    Note over C: Received MARKERs from all → snapshot complete
+    C->>C: Save snapshot to DFS
+```
+
+### What Gets Snapshotted
+
+Each process (coordinator + workers) records its **local state** when it sees the first MARKER:
+
+| Process | Local State to Capture |
+|---|---|
+| **Coordinator** | Which files have been assigned, to whom; which chunks are done; current contents of `primes.txt` (found primes so far); worker list |
+| **Worker** | Which file/chunk it's currently processing; its progress offset within the chunk; primes found locally (not yet reported) |
+
+**Channel state**: Messages in transit between processes at snapshot time. In our system, these are primarily "result" messages (worker → coordinator) and "assignment" messages (coordinator → worker). The Chandy-Lamport algorithm captures these by recording messages received between the local state save and the MARKER arrival on each channel.
+
+### Snapshot Storage
+
+The snapshot is serialized (JSON/pickle) and stored in the DFS as a file:
+- `snapshot_<timestamp>.json` — contains the full global state
+- Written via the existing `ReplicatedAFSClientStub.create()` / `open()` / `write()` / `close()` API
+
+---
+
+## Proposed File Structure
+
+```
+fs/
+└── snapshots/                    # NEW — Task 5 module
+    ├── snapshot.proto             # Snapshot-related gRPC messages
+    ├── snapshot_manager.py        # SnapshotManager class (initiator + participant logic)
+    ├── snapshot_state.py          # Serializable state classes (CoordinatorState, WorkerState)
+    └── test_snapshot.py           # Tests for snapshot + recovery
+```
+
+---
+
+## Proposed Changes
+
+### [NEW] `fs/snapshots/snapshot_state.py`
+
+Defines serializable dataclasses for the state of each process type:
+
+- `WorkerState`: worker_id, assigned_file, chunk_range, progress_offset, local_primes_buffer
+- `CoordinatorState`: assignment_map, completed_chunks, found_primes_set, worker_list
+- `ChannelState`: messages recorded per channel during snapshot
+- `GlobalSnapshot`: timestamp, coordinator_state, worker_states dict, channel_states
+
+### [NEW] `fs/snapshots/snapshot.proto`
+
+gRPC messages for the snapshot protocol between coordinator and workers:
+
+- `MarkerMessage`: snapshot_id, initiator_id
+- `LocalStateReport`: snapshot_id, sender_id, serialized_state, channel_messages
+- `SnapshotComplete`: snapshot_id, dfs_filename
+
+### [NEW] `fs/snapshots/snapshot_manager.py`
+
+Core class that any coordinator/worker process uses:
+
+- **`initiate_snapshot()`** — called periodically by the coordinator:
+  1. Records coordinator's own local state
+  2. Sends MARKER to all workers
+  3. Starts recording incoming channel messages
+  4. Waits for all workers to report their local state
+  5. Assembles `GlobalSnapshot` and writes it to DFS
+
+- **`handle_marker(marker, local_state_fn)`** — called by a worker when it receives a MARKER:
+  1. If first MARKER for this snapshot_id: save local state via `local_state_fn()`, send MARKERs to all other processes, start recording channel messages
+  2. If subsequent MARKER: stop recording on that channel
+
+- **`recover_from_snapshot(snapshot_file)`** — called on startup after a failure:
+  1. Reads the latest `snapshot_*.json` from DFS
+  2. Deserializes and returns the `GlobalSnapshot`
+  3. Each process restores its state from the snapshot
+
+### Integration Points with Task 4
+
+The Task 4 coordinator/worker code needs to:
+1. **Instantiate** a `SnapshotManager` with references to DFS client + peer connections
+2. **Periodically call** `initiate_snapshot()` (e.g., every 30 seconds or every N chunks processed)
+3. **Implement** a `get_local_state()` method that returns the current process state as a serializable object
+4. **On startup**, check for existing snapshots and call `recover_from_snapshot()` if one exists
+5. **Handle MARKER** messages when received from the snapshot manager
+
+---
+
+## Recovery Logic
+
+### Single Worker Failure
+1. Coordinator detects worker timeout
+2. Coordinator reads latest snapshot from DFS
+3. Coordinator extracts the failed worker's state from the snapshot
+4. Coordinator reassigns the failed worker's remaining work (from its last snapshotted progress offset) to a new/recovered worker
+5. Replay any captured channel messages
+
+### Majority Failure
+1. All surviving processes read the latest snapshot from DFS
+2. Each process restores its own state from the snapshot
+3. Coordinator re-establishes the worker pool and reassigns work based on snapshot state
+
+---
+
+## Verification Plan
+
+### Automated Tests (`test_snapshot.py`)
+1. **Snapshot serialization round-trip**: Create mock states → serialize → deserialize → compare
+2. **Marker protocol**: Simulate coordinator + 2 workers, verify all states are captured
+3. **DFS integration**: Write snapshot to DFS, read it back, verify integrity
+4. **Single worker recovery**: Snapshot, kill one worker, recover, verify work resumes from checkpoint
+5. **Full recovery**: Snapshot, kill majority, recover all from snapshot
+
+### Manual Integration Test
+1. Start the replicated DFS cluster (3 servers)
+2. Start the prime-finding application (coordinator + workers)
+3. Feed large input files, let processing run
+4. Kill a worker mid-computation
+5. Verify recovery from snapshot — no duplicate primes, no lost work
+
+---
+
+> [!NOTE]
+> Since Task 4 (the distributed application) doesn't exist yet in the codebase, I'll build the snapshot module as a **standalone, testable component** with clear integration hooks. Once your teammate finishes Task 4, plugging in the snapshot system should be straightforward — they just need to implement `get_local_state()` and call `initiate_snapshot()` periodically.
